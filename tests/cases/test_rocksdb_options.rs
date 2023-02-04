@@ -22,8 +22,8 @@ use rocksdb::crocksdb_ffi::{
 };
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyOptions, CompactOptions, DBOptions, Env,
-    FifoCompactionOptions, IndexType, LRUCacheOptions, ReadOptions, SeekKey, SliceTransform,
-    Writable, WriteOptions, DB,
+    FifoCompactionOptions, IndexType, LRUCacheOptions, RateLimiter, ReadOptions, SeekKey,
+    SliceTransform, Statistics, Writable, WriteOptions, DB,
 };
 
 use super::tempdir_with_prefix;
@@ -75,32 +75,22 @@ fn test_set_max_manifest_file_size() {
 }
 
 #[test]
-fn test_enable_statistics() {
+fn test_set_statistics() {
     let mut opts = DBOptions::new();
-    opts.enable_statistics(true);
+    let statistics = Statistics::new();
+    opts.set_statistics(&statistics);
     opts.set_stats_dump_period_sec(60);
-    assert!(opts.get_statistics().is_some());
-    assert!(opts
-        .get_statistics_histogram(HistogramType::DbSeek)
+    assert!(!statistics.is_empty());
+    assert!(statistics.get_histogram(HistogramType::DbSeek).is_some());
+    assert!(statistics
+        .get_histogram_string(HistogramType::DbSeek)
         .is_some());
-    assert!(opts
-        .get_statistics_histogram_string(HistogramType::DbSeek)
-        .is_some());
+    assert_eq!(statistics.get_ticker_count(TickerType::BlockCacheMiss), 0);
     assert_eq!(
-        opts.get_statistics_ticker_count(TickerType::BlockCacheMiss),
+        statistics.get_and_reset_ticker_count(TickerType::BlockCacheMiss),
         0
     );
-    assert_eq!(
-        opts.get_and_reset_statistics_ticker_count(TickerType::BlockCacheMiss),
-        0
-    );
-    assert_eq!(
-        opts.get_statistics_ticker_count(TickerType::BlockCacheMiss),
-        0
-    );
-
-    let opts = DBOptions::new();
-    assert!(opts.get_statistics().is_none());
+    assert_eq!(statistics.get_ticker_count(TickerType::BlockCacheMiss), 0);
 }
 
 struct FixedPrefixTransform {
@@ -161,7 +151,8 @@ fn test_set_ratelimiter() {
     let mut opts = DBOptions::new();
     opts.create_if_missing(true);
     // compaction and flush rate limited below 100MB/sec
-    opts.set_ratelimiter(100 * 1024 * 1024);
+    let rate_limiter = RateLimiter::new(100 * 1024 * 1024, 100 * 1000, 10);
+    opts.set_rate_limiter(&rate_limiter);
     let db = DB::open(opts, path.path().to_str().unwrap()).unwrap();
     drop(db);
 }
@@ -171,12 +162,14 @@ fn test_set_ratelimiter_with_auto_tuned() {
     let path = tempdir_with_prefix("_rust_rocksdb_test_set_rate_limiter_with_auto_tuned");
     let mut opts = DBOptions::new();
     opts.create_if_missing(true);
-    opts.set_ratelimiter_with_auto_tuned(
+    let rate_limiter = RateLimiter::new_with_auto_tuned(
         100 * 1024 * 1024,
         10 * 100000,
+        10,
         DBRateLimiterMode::AllIo,
         true,
     );
+    opts.set_rate_limiter(&rate_limiter);
     let db = DB::open(opts, path.path().to_str().unwrap()).unwrap();
     drop(db);
 }
@@ -187,16 +180,18 @@ fn test_set_writeampbasedratelimiter_with_auto_tuned() {
         tempdir_with_prefix("_rust_rocksdb_test_set_write_amp_based_rate_limiter_with_auto_tuned");
     let mut opts = DBOptions::new();
     opts.create_if_missing(true);
-    opts.set_writeampbasedratelimiter_with_auto_tuned(
+    let rate_limiter = RateLimiter::new_writeampbased_with_auto_tuned(
         100 * 1024 * 1024,
         10 * 100000,
+        10,
         DBRateLimiterMode::AllIo,
         true,
     );
+    opts.set_rate_limiter(&rate_limiter);
     let db = DB::open(opts, path.path().to_str().unwrap()).unwrap();
-    let mut opts = db.get_db_options();
-    assert!(opts.set_auto_tuned(false).is_ok(), true);
-    assert_eq!(opts.get_auto_tuned().unwrap(), false);
+    let opts = db.get_db_options();
+    opts.get_rate_limiter().unwrap().set_auto_tuned(false);
+    assert_eq!(rate_limiter.get_auto_tuned(), false);
     drop(db);
 }
 
@@ -206,11 +201,14 @@ fn test_set_ratelimiter_bytes_per_second() {
     let mut opts = DBOptions::new();
     opts.create_if_missing(true);
     // compaction and flush rate limited below 100MB/sec
-    opts.set_ratelimiter(100 * 1024 * 1024);
+    let rate_limiter = RateLimiter::new(100 * 1024 * 1024, 100 * 1000, 10);
+    opts.set_rate_limiter(&rate_limiter);
     let db = DB::open(opts, path.path().to_str().unwrap()).unwrap();
-    let mut opts = db.get_db_options();
-    assert!(opts.set_rate_bytes_per_sec(200 * 1024 * 1024).is_ok(), true);
-    assert_eq!(opts.get_rate_bytes_per_sec().unwrap(), 200 * 1024 * 1024);
+    let opts = db.get_db_options();
+    opts.get_rate_limiter()
+        .unwrap()
+        .set_bytes_per_second(200 * 1024 * 1024);
+    assert_eq!(rate_limiter.get_bytes_per_second(), 200 * 1024 * 1024);
     drop(db);
 }
 
@@ -327,7 +325,7 @@ fn test_partitioned_index_filters() {
     // See https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters#how-to-use-it
     block_opts.set_index_type(IndexType::TwoLevelIndexSearch);
     block_opts.set_partition_filters(true);
-    block_opts.set_bloom_filter(10, false);
+    block_opts.set_bloom_filter(10.0, false);
     block_opts.set_metadata_block_size(4096);
     block_opts.set_cache_index_and_filter_blocks(true);
     block_opts.set_pin_top_level_index_and_filter(true);
@@ -754,7 +752,7 @@ fn test_read_options() {
 
     let mut read_opts = ReadOptions::new();
     read_opts.set_verify_checksums(true);
-    read_opts.fill_cache(true);
+    read_opts.set_fill_cache(true);
     read_opts.set_tailing(true);
     read_opts.set_pin_data(true);
     read_opts.set_background_purge_on_iterator_cleanup(true);
@@ -808,7 +806,8 @@ fn test_block_based_options() {
 
     let mut opts = DBOptions::new();
     opts.create_if_missing(true);
-    opts.enable_statistics(true);
+    let statistics = Statistics::new();
+    opts.set_statistics(&statistics);
     opts.set_stats_dump_period_sec(60);
     let mut bopts = BlockBasedOptions::new();
     bopts.set_read_amp_bytes_per_bit(4);
@@ -823,11 +822,11 @@ fn test_block_based_options() {
     db.flush(true).unwrap();
     db.get(b"a").unwrap();
     assert_ne!(
-        opts.get_statistics_ticker_count(TickerType::ReadAmpTotalReadBytes),
+        statistics.get_ticker_count(TickerType::ReadAmpTotalReadBytes),
         0
     );
     assert_ne!(
-        opts.get_statistics_ticker_count(TickerType::ReadAmpEstimateUsefulBytes),
+        statistics.get_ticker_count(TickerType::ReadAmpEstimateUsefulBytes),
         0
     );
 }
@@ -922,8 +921,8 @@ fn test_compact_on_deletion() {
     opt.set_target_level(1);
     db.compact_range_cf_opt(cf, &opt, None, None);
 
-    let name = format!("rocksdb.num-files-at-level{}", 1);
-    assert_eq!(db.get_property_int(&name).unwrap(), 1);
+    let level1_prop = format!("rocksdb.num-files-at-level{}", 1);
+    assert_eq!(db.get_property_int(&level1_prop).unwrap(), 1);
 
     for i in 0..num_keys {
         if i >= num_keys - window_size && i < num_keys - window_size + dels_trigger {
@@ -933,10 +932,15 @@ fn test_compact_on_deletion() {
         }
     }
     db.flush(true).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    let name = format!("rocksdb.num-files-at-level{}", 0);
-    assert_eq!(db.get_property_int(&name).unwrap(), 0);
-    let name = format!("rocksdb.num-files-at-level{}", 1);
-    assert_eq!(db.get_property_int(&name).unwrap(), 1);
+    let max_retry = 1000;
+    let level0_prop = format!("rocksdb.num-files-at-level{}", 0);
+    for _ in 0..max_retry {
+        if db.get_property_int(&level0_prop).unwrap() == 0 {
+            break;
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    assert_eq!(db.get_property_int(&level0_prop).unwrap(), 0);
+    assert_eq!(db.get_property_int(&level1_prop).unwrap(), 1);
 }

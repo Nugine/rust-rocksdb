@@ -83,7 +83,7 @@ extern "C" fn name<C: CompactionFilter>(filter: *mut c_void) -> *const c_char {
 
 extern "C" fn destructor<C: CompactionFilter>(filter: *mut c_void) {
     unsafe {
-        Box::from_raw(filter as *mut CompactionFilterProxy<C>);
+        let _ = Box::from_raw(filter as *mut CompactionFilterProxy<C>);
     }
 }
 
@@ -130,7 +130,7 @@ extern "C" fn filter<C: CompactionFilter>(
 }
 
 pub struct CompactionFilterHandle {
-    pub inner: *mut DBCompactionFilter,
+    pub(crate) inner: *mut DBCompactionFilter,
 }
 
 impl Drop for CompactionFilterHandle {
@@ -267,7 +267,7 @@ mod factory {
 
     pub(super) extern "C" fn destructor<C: CompactionFilterFactory>(factory: *mut c_void) {
         unsafe {
-            Box::from_raw(factory as *mut CompactionFilterFactoryProxy<C>);
+            let _ = Box::from_raw(factory as *mut CompactionFilterFactoryProxy<C>);
         }
     }
 
@@ -295,7 +295,7 @@ mod factory {
 }
 
 pub struct CompactionFilterFactoryHandle {
-    pub inner: *mut DBCompactionFilterFactory,
+    pub(crate) inner: *mut DBCompactionFilterFactory,
 }
 
 impl Drop for CompactionFilterFactoryHandle {
@@ -386,8 +386,8 @@ mod tests {
         ) -> *mut DBCompactionFilter {
             let start_key = context.start_key();
             let end_key = context.end_key();
-            &self.0.send(start_key.to_owned()).unwrap();
-            &self.0.send(end_key.to_owned()).unwrap();
+            self.0.send(start_key.to_owned()).unwrap();
+            self.0.send(end_key.to_owned()).unwrap();
 
             unsafe {
                 new_compaction_filter_raw::<KeyRangeFilter>(
@@ -523,7 +523,6 @@ mod tests {
         db.compact_range_cf(cfh, None, None);
         let sk = rx.recv().unwrap();
         let ek = rx.recv().unwrap();
-        println!("sk:{:?} ek:{:?}", sk, ek);
         let sk = str::from_utf8(&sk).unwrap();
         let ek = str::from_utf8(&ek).unwrap();
         assert_eq!("key0", sk);

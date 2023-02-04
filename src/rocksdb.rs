@@ -14,23 +14,23 @@
 
 use crocksdb_ffi::{
     self, DBBackupEngine, DBCFHandle, DBCache, DBCompressionType, DBEnv, DBInstance, DBMapProperty,
-    DBPinnableSlice, DBSequentialFile, DBStatisticsHistogramType, DBStatisticsTickerType,
-    DBTablePropertiesCollection, DBTitanDBOptions,
+    DBPinnableSlice, DBPostWriteCallback, DBSequentialFile, DBTablePropertiesCollection,
+    DBTitanDBOptions, DBWriteBatch,
 };
 use libc::{self, c_char, c_int, c_void, size_t};
 use librocksdb_sys::DBMemoryAllocator;
 use metadata::ColumnFamilyMetaData;
 use rocksdb_options::{
     CColumnFamilyDescriptor, ColumnFamilyDescriptor, ColumnFamilyOptions, CompactOptions,
-    CompactionOptions, DBOptions, EnvOptions, FlushOptions, HistogramData,
-    IngestExternalFileOptions, LRUCacheOptions, ReadOptions, RestoreOptions, UnsafeSnap,
-    WriteOptions,
+    CompactionOptions, DBOptions, EnvOptions, FlushOptions, IngestExternalFileOptions,
+    LRUCacheOptions, ReadOptions, RestoreOptions, UnsafeSnap, WriteOptions,
 };
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::fmt::{self, Debug, Formatter};
 use std::io;
 use std::mem;
+use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -71,14 +71,14 @@ fn ensure_default_cf_exists<'a>(
     ttls: &mut Vec<i32>,
     is_titan: bool,
 ) {
-    let contains = list.iter().any(|ref cf| cf.is_default());
+    let contains = list.iter().any(|cf| cf.is_default());
     if !contains {
         let mut desc = ColumnFamilyDescriptor::default();
         if is_titan {
             desc.options.set_titandb_options(&TitanDBOptions::new());
         }
         list.push(desc);
-        if ttls.len() > 0 {
+        if !ttls.is_empty() {
             ttls.push(0);
         }
     }
@@ -138,11 +138,7 @@ impl MapProperty {
 
     pub fn get_property_int_value(&self, property: &str) -> u64 {
         let propname = CString::new(property.as_bytes()).unwrap();
-        unsafe {
-            let value =
-                crocksdb_ffi::crocksdb_map_property_int_value(self.inner, propname.as_ptr());
-            return value as u64;
-        }
+        unsafe { crocksdb_ffi::crocksdb_map_property_int_value(self.inner, propname.as_ptr()) }
     }
 }
 
@@ -291,7 +287,7 @@ impl<D> DBIterator<D> {
         let key_len_ptr: *mut size_t = &mut key_len;
         unsafe {
             let key_ptr = crocksdb_ffi::crocksdb_iter_key(self.inner, key_len_ptr);
-            slice::from_raw_parts(key_ptr, key_len as usize)
+            slice::from_raw_parts(key_ptr, key_len)
         }
     }
 
@@ -302,7 +298,7 @@ impl<D> DBIterator<D> {
         let val_len_ptr: *mut size_t = &mut val_len;
         unsafe {
             let val_ptr = crocksdb_ffi::crocksdb_iter_value(self.inner, val_len_ptr);
-            slice::from_raw_parts(val_ptr, val_len as usize)
+            slice::from_raw_parts(val_ptr, val_len)
         }
     }
 
@@ -394,7 +390,7 @@ impl<D: Deref<Target = DB>> Snapshot<D> {
         unsafe {
             Snapshot {
                 snap: db.unsafe_snap(),
-                db: db,
+                db,
             }
         }
     }
@@ -475,10 +471,43 @@ pub struct Range<'a> {
 
 impl<'a> Range<'a> {
     pub fn new(start_key: &'a [u8], end_key: &'a [u8]) -> Range<'a> {
-        Range {
-            start_key: start_key,
-            end_key: end_key,
+        Range { start_key, end_key }
+    }
+}
+
+pub struct PostWriteCallback<'a, F: FnMut(u64)> {
+    _callback: &'a mut F,
+    raw_buf: MaybeUninit<[u64; 3]>,
+}
+
+extern "C" fn on_post_write_callback<F: FnMut(u64)>(ctx: *mut c_void, seq: u64) {
+    unsafe {
+        let ctx = &mut *(ctx as *mut F);
+        ctx(seq);
+    }
+}
+
+impl<'a, F: FnMut(u64)> PostWriteCallback<'a, F> {
+    #[inline]
+    fn new(f: &'a mut F) -> Self {
+        unsafe {
+            let mut raw_buf: MaybeUninit<[u64; 3]> = MaybeUninit::uninit();
+            crocksdb_ffi::crocksdb_post_write_callback_init(
+                raw_buf.as_mut_ptr() as *mut c_void,
+                std::mem::size_of_val(&raw_buf),
+                f as *mut F as *mut c_void,
+                on_post_write_callback::<F>,
+            );
+            Self {
+                _callback: f,
+                raw_buf,
+            }
         }
+    }
+
+    #[inline]
+    fn as_raw_callback(&mut self) -> *mut DBPostWriteCallback {
+        self.raw_buf.as_mut_ptr() as *mut DBPostWriteCallback
     }
 }
 
@@ -503,7 +532,7 @@ impl DB {
 
     pub fn open_with_ttl(opts: DBOptions, path: &str, ttls: &[i32]) -> Result<DB, String> {
         let cfds: Vec<&str> = vec![];
-        if ttls.len() == 0 {
+        if ttls.is_empty() {
             return Err("ttls is empty in with_ttl function".to_owned());
         }
         DB::open_cf_with_ttl(opts, path, cfds, ttls)
@@ -525,7 +554,7 @@ impl DB {
     where
         T: Into<ColumnFamilyDescriptor<'a>>,
     {
-        if ttls.len() == 0 {
+        if ttls.is_empty() {
             return Err("ttls is empty in with_ttl function".to_owned());
         }
         DB::open_cf_internal(opts, path, cfds, ttls, None)
@@ -569,7 +598,7 @@ impl DB {
         const ERR_NULL_CF_HANDLE: &str = "Received null column family handle from DB";
 
         let cpath = CString::new(path.as_bytes()).map_err(|_| ERR_CONVERT_PATH.to_owned())?;
-        fs::create_dir_all(&Path::new(path)).map_err(|e| {
+        fs::create_dir_all(Path::new(path)).map_err(|e| {
             format!(
                 "Failed to create rocksdb directory: \
                  src/rocksdb.rs:                              \
@@ -605,7 +634,7 @@ impl DB {
 
         let readonly = error_if_log_file_exist.is_some();
 
-        let with_ttl = if ttls_vec.len() > 0 {
+        let with_ttl = if !ttls_vec.is_empty() {
             if ttls_vec.len() == cf_names.len() {
                 true
             } else {
@@ -792,6 +821,18 @@ impl DB {
         }
     }
 
+    pub fn disable_manual_compaction(&self) {
+        unsafe {
+            crocksdb_ffi::crocksdb_disable_manual_compaction(self.inner);
+        }
+    }
+
+    pub fn enable_manual_compaction(&self) {
+        unsafe {
+            crocksdb_ffi::crocksdb_enable_manual_compaction(self.inner);
+        }
+    }
+
     pub fn path(&self) -> &str {
         &self.path
     }
@@ -799,6 +840,65 @@ impl DB {
     pub fn write_opt(&self, batch: &WriteBatch, writeopts: &WriteOptions) -> Result<(), String> {
         unsafe {
             ffi_try!(crocksdb_write(self.inner, writeopts.inner, batch.inner));
+        }
+        Ok(())
+    }
+
+    pub fn write_callback<F: FnMut(u64)>(
+        &self,
+        batch: &WriteBatch,
+        writeopts: &WriteOptions,
+        mut callback: F,
+    ) -> Result<(), String> {
+        let mut callback = PostWriteCallback::new(&mut callback);
+        unsafe {
+            ffi_try!(crocksdb_write_callback(
+                self.inner,
+                writeopts.inner,
+                batch.inner,
+                callback.as_raw_callback()
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn multi_batch_write(
+        &self,
+        batches: &[WriteBatch],
+        writeopts: &WriteOptions,
+    ) -> Result<(), String> {
+        unsafe {
+            let b: Vec<*mut DBWriteBatch> = batches.iter().map(|w| w.inner).collect();
+            if !b.is_empty() {
+                ffi_try!(crocksdb_write_multi_batch(
+                    self.inner,
+                    writeopts.inner,
+                    b.as_ptr(),
+                    b.len()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn multi_batch_write_callback<F: FnMut(u64)>(
+        &self,
+        batches: &[WriteBatch],
+        writeopts: &WriteOptions,
+        mut callback: F,
+    ) -> Result<(), String> {
+        let mut callback = PostWriteCallback::new(&mut callback);
+        unsafe {
+            let b: Vec<*mut DBWriteBatch> = batches.iter().map(|w| w.inner).collect();
+            if !b.is_empty() {
+                ffi_try!(crocksdb_write_multi_batch_callback(
+                    self.inner,
+                    writeopts.inner,
+                    b.as_ptr(),
+                    b.len(),
+                    callback.as_raw_callback()
+                ));
+            }
         }
         Ok(())
     }
@@ -952,7 +1052,7 @@ impl DB {
     }
 
     pub fn iter_opt(&self, opt: ReadOptions) -> DBIterator<&DB> {
-        DBIterator::new(&self, opt)
+        DBIterator::new(self, opt)
     }
 
     pub fn iter_cf(&self, cf_handle: &CFHandle) -> DBIterator<&DB> {
@@ -1581,39 +1681,6 @@ impl DB {
         None
     }
 
-    pub fn get_statistics(&self) -> Option<String> {
-        self.opts.get_statistics()
-    }
-
-    pub fn reset_statistics(&self) {
-        self.opts.reset_statistics();
-    }
-
-    pub fn get_statistics_ticker_count(&self, ticker_type: DBStatisticsTickerType) -> u64 {
-        self.opts.get_statistics_ticker_count(ticker_type)
-    }
-
-    pub fn get_and_reset_statistics_ticker_count(
-        &self,
-        ticker_type: DBStatisticsTickerType,
-    ) -> u64 {
-        self.opts.get_and_reset_statistics_ticker_count(ticker_type)
-    }
-
-    pub fn get_statistics_histogram_string(
-        &self,
-        hist_type: DBStatisticsHistogramType,
-    ) -> Option<String> {
-        self.opts.get_statistics_histogram_string(hist_type)
-    }
-
-    pub fn get_statistics_histogram(
-        &self,
-        hist_type: DBStatisticsHistogramType,
-    ) -> Option<HistogramData> {
-        self.opts.get_statistics_histogram(hist_type)
-    }
-
     pub fn get_db_options(&self) -> DBOptions {
         unsafe {
             let inner = crocksdb_ffi::crocksdb_get_db_options(self.inner);
@@ -1818,6 +1885,10 @@ impl DB {
         DB::open_default(restore_db_path)
     }
 
+    pub fn new_checkpointer(&self) -> Result<crate::Checkpointer, String> {
+        crate::Checkpointer::new(self.inner, self.is_titan())
+    }
+
     pub fn get_block_cache_usage(&self) -> u64 {
         self.get_options().get_block_cache_usage()
     }
@@ -1924,7 +1995,7 @@ impl DB {
                 end_key.as_ptr(),
                 end_key.len() as size_t
             ));
-            let size = crocksdb_ffi::crocksdb_keyversions_count(kvs) as usize;
+            let size = crocksdb_ffi::crocksdb_keyversions_count(kvs);
             let mut key_versions = Vec::with_capacity(size);
             for i in 0..size {
                 key_versions.push(KeyVersion {
@@ -2039,7 +2110,7 @@ impl Drop for DB {
             // DB::SyncWal requires writable file support thread safe sync, but
             // not all types of env can create writable file that support thread
             // safe sync. eg, MemEnv.
-            self.sync_wal().unwrap_or_else(|_| {});
+            let _ = self.sync_wal();
         }
         unsafe {
             self.cfs.clear();
@@ -2474,7 +2545,7 @@ impl SstFileWriter {
     }
 
     pub fn file_size(&mut self) -> u64 {
-        unsafe { crocksdb_ffi::crocksdb_sstfilewriter_file_size(self.inner) as u64 }
+        unsafe { crocksdb_ffi::crocksdb_sstfilewriter_file_size(self.inner) }
     }
 }
 
@@ -2501,7 +2572,7 @@ impl ExternalSstFileInfo {
         let mut len: size_t = 0;
         unsafe {
             let ptr = crocksdb_ffi::crocksdb_externalsstfileinfo_file_path(self.inner, &mut len);
-            let bytes = slice::from_raw_parts(ptr, len as usize);
+            let bytes = slice::from_raw_parts(ptr, len);
             PathBuf::from(String::from_utf8(bytes.to_owned()).unwrap())
         }
     }
@@ -2510,7 +2581,7 @@ impl ExternalSstFileInfo {
         let mut len: size_t = 0;
         unsafe {
             let ptr = crocksdb_ffi::crocksdb_externalsstfileinfo_smallest_key(self.inner, &mut len);
-            slice::from_raw_parts(ptr, len as usize)
+            slice::from_raw_parts(ptr, len)
         }
     }
 
@@ -2518,20 +2589,20 @@ impl ExternalSstFileInfo {
         let mut len: size_t = 0;
         unsafe {
             let ptr = crocksdb_ffi::crocksdb_externalsstfileinfo_largest_key(self.inner, &mut len);
-            slice::from_raw_parts(ptr, len as usize)
+            slice::from_raw_parts(ptr, len)
         }
     }
 
     pub fn sequence_number(&self) -> u64 {
-        unsafe { crocksdb_ffi::crocksdb_externalsstfileinfo_sequence_number(self.inner) as u64 }
+        unsafe { crocksdb_ffi::crocksdb_externalsstfileinfo_sequence_number(self.inner) }
     }
 
     pub fn file_size(&self) -> u64 {
-        unsafe { crocksdb_ffi::crocksdb_externalsstfileinfo_file_size(self.inner) as u64 }
+        unsafe { crocksdb_ffi::crocksdb_externalsstfileinfo_file_size(self.inner) }
     }
 
     pub fn num_entries(&self) -> u64 {
-        unsafe { crocksdb_ffi::crocksdb_externalsstfileinfo_num_entries(self.inner) as u64 }
+        unsafe { crocksdb_ffi::crocksdb_externalsstfileinfo_num_entries(self.inner) }
     }
 }
 
@@ -2545,7 +2616,7 @@ impl Drop for ExternalSstFileInfo {
 
 pub fn supported_compression() -> Vec<DBCompressionType> {
     unsafe {
-        let size = crocksdb_ffi::crocksdb_get_supported_compression_number() as usize;
+        let size = crocksdb_ffi::crocksdb_get_supported_compression_number();
         let mut v: Vec<DBCompressionType> = Vec::with_capacity(size);
         let pv = v.as_mut_ptr();
         crocksdb_ffi::crocksdb_get_supported_compression(pv, size as size_t);
@@ -2555,7 +2626,7 @@ pub fn supported_compression() -> Vec<DBCompressionType> {
 }
 
 pub struct Env {
-    pub inner: *mut DBEnv,
+    pub(crate) inner: *mut DBEnv,
     #[allow(dead_code)]
     base: Option<Arc<Env>>,
 }
@@ -2682,6 +2753,14 @@ impl Env {
         }
     }
 
+    pub fn is_db_locked(&self, path: &str) -> Result<bool, String> {
+        unsafe {
+            let file_path = CString::new(path).unwrap();
+            let locked = ffi_try!(crocksdb_env_is_db_locked(self.inner, file_path.as_ptr()));
+            Ok(locked)
+        }
+    }
+
     pub fn set_background_threads(&self, n: i32) {
         unsafe {
             crocksdb_ffi::crocksdb_env_set_background_threads(self.inner, n);
@@ -2709,7 +2788,7 @@ pub struct SequentialFile {
 
 impl SequentialFile {
     fn new(inner: *mut DBSequentialFile) -> SequentialFile {
-        SequentialFile { inner: inner }
+        SequentialFile { inner }
     }
 
     pub fn skip(&mut self, n: usize) -> Result<(), String> {
@@ -2738,7 +2817,7 @@ impl io::Read for SequentialFile {
                     crocksdb_ffi::error_message(err),
                 ));
             }
-            Ok(size as usize)
+            Ok(size)
         }
     }
 }
@@ -2752,8 +2831,11 @@ impl Drop for SequentialFile {
 }
 
 pub struct Cache {
-    pub inner: *mut DBCache,
+    pub(crate) inner: *mut DBCache,
 }
+
+unsafe impl Sync for Cache {}
+unsafe impl Send for Cache {}
 
 impl Cache {
     pub fn new_lru_cache(opt: LRUCacheOptions) -> Cache {
@@ -2775,7 +2857,7 @@ impl Drop for Cache {
 }
 
 pub struct MemoryAllocator {
-    pub inner: *mut DBMemoryAllocator,
+    pub(crate) inner: *mut DBMemoryAllocator,
 }
 
 impl MemoryAllocator {
@@ -2893,7 +2975,7 @@ mod test {
     use write_batch::WriteBatchRef;
 
     use super::*;
-    use crate::tempdir_with_prefix;
+    use crate::{tempdir_with_prefix, ConcurrentTaskLimiter};
 
     #[test]
     fn external() {
@@ -3492,25 +3574,31 @@ mod test {
     }
 
     #[test]
-    fn test_commit_pipeline() {
+    fn test_multi_batch_write() {
         let mut opts = DBOptions::new();
         opts.create_if_missing(true);
-        opts.enable_pipelined_commit(true);
+        opts.enable_multi_batch_write(true);
         opts.enable_pipelined_write(false);
         let path = tempdir_with_prefix("_rust_rocksdb_commit_pipeline");
 
         let db = DB::open(opts, path.path().to_str().unwrap()).unwrap();
         let cf = db.cf_handle("default").unwrap();
-        let w = WriteBatch::new();
+        let mut data = Vec::new();
         for s in &[b"ab", b"cd", b"ef"] {
+            let w = WriteBatch::new();
             w.put_cf(cf, s.to_vec().as_slice(), b"a").unwrap();
+            data.push(w);
         }
-        db.write(&w).unwrap();
+        let mut seqno = 0;
+        db.multi_batch_write_callback(&data, &WriteOptions::new(), |s| seqno = s)
+            .unwrap();
         for s in &[b"ab", b"cd", b"ef"] {
             let v = db.get_cf(cf, s.to_vec().as_slice()).unwrap();
             assert!(v.is_some());
             assert_eq!(v.unwrap().to_utf8().unwrap(), "a");
         }
+        assert!(seqno > 0);
+        assert!(seqno <= db.get_latest_sequence_number());
     }
 
     #[test]
@@ -3729,5 +3817,27 @@ mod test {
         env.set_background_threads(0);
         env.set_high_priority_background_threads(4);
         env.set_high_priority_background_threads(0);
+    }
+
+    #[test]
+    fn test_compaction_thread_limiter() {
+        let path = tempdir_with_prefix("_rust_rocksdb_test_compaction_thread_limiter");
+        let cfs = ["default", "cf1"];
+        let mut cfs_opts = vec![];
+        let limiter = ConcurrentTaskLimiter::new("test", 3);
+        for _ in 0..cfs.len() {
+            let mut opts = ColumnFamilyOptions::new();
+            opts.set_compaction_thread_limiter(&limiter);
+            cfs_opts.push(opts);
+        }
+        let mut opts = DBOptions::new();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let _db = DB::open_cf(
+            opts,
+            path.path().to_str().unwrap(),
+            cfs.iter().map(|cf| *cf).zip(cfs_opts).collect(),
+        )
+        .unwrap();
     }
 }
